@@ -1,0 +1,24 @@
+{
+  "name": "gh-file-attach",
+  "version": "1.3.1",
+  "description": "Upload images, videos, documents, code files, and archives to GitHub from Claude Code. Replicates GitHub's 'Attach files' feature from the CLI using the official Releases API.",
+  "author": {
+    "name": "Aravind Pilla",
+    "url": "https://github.com/vindu939"
+  },
+  "homepage": "https://github.com/vindu939/gh-file-attach-plugin",
+  "repository": "https://github.com/vindu939/gh-file-attach-plugin",
+  "license": "MIT",
+  "keywords": [
+    "github",
+    "upload",
+    "images",
+    "screenshots",
+    "videos",
+    "files",
+    "attachments",
+    "releases",
+    "pr",
+    "pull-request"
+  ]
+}

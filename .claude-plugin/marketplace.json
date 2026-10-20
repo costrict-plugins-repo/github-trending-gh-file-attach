@@ -1,0 +1,14 @@
+{
+  "name": "gh-file-attach-plugin",
+  "owner": {
+    "name": "Aravind Pilla"
+  },
+  "plugins": [
+    {
+      "name": "gh-file-attach",
+      "source": "./",
+      "description": "Upload images, videos, documents, and archives to GitHub from Claude Code using the official Releases API.",
+      "version": "1.3.1"
+    }
+  ]
+}

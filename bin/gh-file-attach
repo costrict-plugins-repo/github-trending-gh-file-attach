@@ -1,0 +1,766 @@
+#!/usr/bin/env bash
+# gh-file-attach — Attach files to GitHub and get shareable URLs
+# Replicates GitHub's "Attach files" feature from the CLI
+# https://github.com/vindu939/gh-file-attach
+#
+# Usage:
+#   gh file-attach <file> [<file>...]
+#   gh file-attach -m "Label:file.png" [...]
+#   gh file-attach --repo owner/repo <file>
+
+set -euo pipefail
+
+VERSION="1.2.0"
+RELEASE_TAG="_attachments"
+RELEASE_TITLE="Attachments"
+RELEASE_BODY="Auto-managed release for file attachments. Do not delete."
+MAX_FILES_PER_RUN=50
+
+# Size limits per category (bytes)
+MAX_IMAGE_SIZE=$((50 * 1024 * 1024))    # 50 MB
+MAX_VIDEO_SIZE=$((200 * 1024 * 1024))   # 200 MB
+MAX_AUDIO_SIZE=$((50 * 1024 * 1024))    # 50 MB
+MAX_DOCUMENT_SIZE=$((25 * 1024 * 1024)) # 25 MB
+MAX_CODE_SIZE=$((10 * 1024 * 1024))     # 10 MB
+MAX_ARCHIVE_SIZE=$((50 * 1024 * 1024))  # 50 MB
+MAX_OTHER_SIZE=$((25 * 1024 * 1024))    # 25 MB
+
+# --- File Type Classification ------------------------------------------------
+
+# Returns: image, video, audio, document, code, archive, text, other, unsupported
+classify_file() {
+  local ext="$1"
+  case "$ext" in
+    # Images
+    png|jpg|jpeg|gif|webp|svg|bmp|ico|tiff|tif|avif)
+      echo "image" ;;
+    # Videos
+    mp4|mov|webm|avi|mkv)
+      echo "video" ;;
+    # Audio
+    mp3|wav|ogg|flac|aac|m4a)
+      echo "audio" ;;
+    # Documents
+    pdf|docx|pptx|xlsx|xls|xlsm|rtf|doc|odt|fodt|ods|fods|odp|fodp|odg|fodg|odf)
+      echo "document" ;;
+    # Code
+    c|cs|cpp|css|drawio|html|htm|java|js|jsx|ipynb|patch|php|py|rb|rs|sh|sql|ts|tsx|xml|yaml|yml|go|swift|kt|scala|r|pl|lua|zig|dart|vue|svelte)
+      echo "code" ;;
+    # Archives
+    zip|gz|tgz|tar|bz2|xz|7z|rar)
+      echo "archive" ;;
+    # Text/Data
+    txt|md|csv|tsv|log|json|jsonc|toml|ini|cfg|conf|env|properties)
+      echo "text" ;;
+    # Debug/Communication
+    debug|msg|eml|dmp|pdb|cpuprofile)
+      echo "other" ;;
+    *)
+      echo "unsupported" ;;
+  esac
+}
+
+# Get max file size for a category
+max_size_for() {
+  local category="$1"
+  case "$category" in
+    image)    echo "$MAX_IMAGE_SIZE" ;;
+    video)    echo "$MAX_VIDEO_SIZE" ;;
+    audio)    echo "$MAX_AUDIO_SIZE" ;;
+    document) echo "$MAX_DOCUMENT_SIZE" ;;
+    code)     echo "$MAX_CODE_SIZE" ;;
+    archive)  echo "$MAX_ARCHIVE_SIZE" ;;
+    text)     echo "$MAX_OTHER_SIZE" ;;
+    other)    echo "$MAX_OTHER_SIZE" ;;
+    *)        echo "$MAX_OTHER_SIZE" ;;
+  esac
+}
+
+# Get markdown prefix icon for a category
+markdown_icon() {
+  local category="$1"
+  case "$category" in
+    image)    echo "" ;;    # No prefix — uses ![label](url)
+    video)    echo "▶ " ;;
+    audio)    echo "🔊 " ;;
+    document) echo "📄 " ;;
+    code)     echo "📝 " ;;
+    archive)  echo "📦 " ;;
+    text)     echo "📝 " ;;
+    other)    echo "📎 " ;;
+    *)        echo "📎 " ;;
+  esac
+}
+
+# --- Helpers ---------------------------------------------------------------
+
+die() { echo "error: $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+Attach files to GitHub and get shareable URLs.
+Replicates GitHub's "Attach files" feature from the CLI.
+
+USAGE
+  gh file-attach [flags] <file> [<file>...]
+  gh file-attach --list [--repo OWNER/REPO]
+  gh file-attach --stats [--repo OWNER/REPO]
+  gh file-attach --cleanup <Nd|N> [--repo OWNER/REPO]
+
+FLAGS
+  -r, --repo OWNER/REPO   Target repository (default: current repo)
+  -t, --tag TAG            Release tag for storage (default: _attachments)
+  -m, --markdown           Output as markdown syntax
+  -c, --clipboard          Copy output to clipboard
+      --public             Make the release non-draft (required for browser access)
+  -v, --version            Print version
+  -h, --help               Show this help
+
+MANAGEMENT
+      --list               List all uploaded attachments with size and date
+      --stats              Show storage usage breakdown by file type
+      --cleanup <Nd>       Delete assets older than N days (e.g. 30d)
+      --cleanup <N>        Keep only the latest N assets, delete the rest (e.g. 100)
+
+ARGUMENTS
+  Arguments can be plain file paths or "label:path" pairs.
+  The label is used as the display text in markdown output.
+
+    screenshot.png                  Uses filename as label
+    "Before fix:before.png"         Uses "Before fix" as label
+    "Demo:recording.mp4"            Uses "Demo" as label
+
+MARKDOWN OUTPUT (-m)
+  Images:     ![label](url)           — renders inline on GitHub
+  Videos:     [▶ label](url)          — clickable link
+  Audio:      [🔊 label](url)         — clickable link
+  Documents:  [📄 label](url)         — clickable link
+  Code:       [📝 label](url)         — clickable link
+  Archives:   [📦 label](url)         — clickable link
+
+SUPPORTED FORMATS
+  Images:     png, jpg, jpeg, gif, webp, svg, bmp, ico, tiff, avif
+  Videos:     mp4, mov, webm, avi, mkv
+  Audio:      mp3, wav, ogg, flac, aac, m4a
+  Documents:  pdf, docx, pptx, xlsx, xls, rtf, doc, odt, ods, odp, odg, odf
+  Code:       py, js, ts, tsx, jsx, java, c, cpp, cs, go, rs, rb, sh, sql,
+              html, css, xml, yaml, yml, swift, kt, scala, vue, svelte, and more
+  Archives:   zip, gz, tgz, tar, bz2, xz, 7z, rar
+  Text/Data:  txt, md, csv, tsv, log, json, toml, ini, cfg, conf
+  Other:      debug, msg, eml, dmp, pdb, cpuprofile
+
+SIZE LIMITS
+  Images:     50 MB       Videos:    200 MB
+  Audio:      50 MB       Documents: 25 MB
+  Code:       10 MB       Archives:  50 MB
+  Text/Other: 25 MB
+  Max files per run: $MAX_FILES_PER_RUN
+
+STORAGE
+  Files are uploaded as GitHub Release assets in the target repository.
+  They are stored under a release tagged '_attachments' (configurable with --tag).
+  View uploads in browser: https://github.com/OWNER/REPO/releases/tag/_attachments
+
+  GitHub repo storage limits:
+    Free/Pro/Team: 5 GB total (warning at 1 GB)
+    Enterprise:    100 GB total (warning at 5 GB)
+  Release assets count toward total repo size.
+
+EXAMPLES
+  gh file-attach screenshot.png
+  gh file-attach -m "Before fix:before.png" "After fix:after.png"
+  gh file-attach -m "Demo:recording.mp4" "Logs:debug.log"
+  gh file-attach -m -c "Report:quarterly.pdf" data.csv
+  gh file-attach --public --repo myorg/myrepo *.png
+  gh file-attach --list
+  gh file-attach --stats
+  gh file-attach --cleanup 30d
+  gh file-attach --cleanup 100
+EOF
+  exit 0
+}
+
+check_prereqs() {
+  command -v gh >/dev/null 2>&1 || die "gh CLI is required. Install: https://cli.github.com"
+  gh auth status >/dev/null 2>&1 || die "Not authenticated. Run: gh auth login"
+  # URL encoding requires jq or python3
+  if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+    die "jq or python3 is required for URL encoding. Install one: brew install jq"
+  fi
+}
+
+# Validate repo format: owner/repo with allowed characters
+validate_repo() {
+  local repo="$1"
+  if [[ ! "$repo" =~ ^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$ ]]; then
+    die "Invalid repo format: '$repo' (expected OWNER/REPO, e.g. myorg/myrepo)"
+  fi
+}
+
+# Validate tag format: alphanumeric, dots, hyphens, underscores, slashes
+validate_tag() {
+  local tag="$1"
+  if [[ ! "$tag" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+    die "Invalid tag format: '$tag' (only alphanumeric, dots, hyphens, underscores, slashes allowed)"
+  fi
+}
+
+resolve_repo() {
+  if [[ -n "${REPO:-}" ]]; then
+    echo "$REPO"
+    return
+  fi
+  local repo
+  repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) \
+    || die "Not in a git repo and --repo not specified"
+  echo "$repo"
+}
+
+# Percent-encode a string for use in URLs (requires jq or python3)
+urlencode() {
+  local string="$1"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$string" | jq -rR @uri
+  else
+    python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$string"
+  fi
+}
+
+file_size() {
+  local file="$1"
+  stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null
+}
+
+ensure_release() {
+  local repo="$1"
+  local draft_args=()
+  if [[ "${PUBLIC:-false}" != "true" ]]; then
+    draft_args+=(--draft)
+  fi
+
+  if ! gh release view "$RELEASE_TAG" --repo "$repo" >/dev/null 2>&1; then
+    gh release create "$RELEASE_TAG" \
+      --repo "$repo" \
+      --title "$RELEASE_TITLE" \
+      --notes "$RELEASE_BODY" \
+      ${draft_args[@]+"${draft_args[@]}"} >/dev/null 2>&1 \
+      || die "Failed to create release '$RELEASE_TAG' in $repo"
+    echo "Created release '$RELEASE_TAG' in $repo" >&2
+  elif [[ "${PUBLIC:-false}" == "true" ]]; then
+    local is_draft
+    is_draft=$(gh release view "$RELEASE_TAG" --repo "$repo" --json isDraft --jq '.isDraft' 2>/dev/null || echo "false")
+    if [[ "$is_draft" == "true" ]]; then
+      gh release edit "$RELEASE_TAG" --repo "$repo" --draft=false >/dev/null 2>&1
+      echo "Updated release '$RELEASE_TAG' to public in $repo" >&2
+    fi
+  fi
+}
+
+unique_name() {
+  local file="$1"
+  local base ext ts rand
+  base=$(basename "$file")
+
+  # Handle files with no extension or dotfiles
+  if [[ "$base" == *.* && "$base" != .* ]]; then
+    ext="${base##*.}"
+    base="${base%.*}"
+  elif [[ "$base" == .* && "$base" == *.*.* ]]; then
+    # Dotfile with extension like .config.yaml
+    ext="${base##*.}"
+    base="${base%.*}"
+  else
+    # No extension (Makefile) or simple dotfile (.gitignore)
+    ext=""
+    base="$base"
+  fi
+
+  ts=$(date +%Y%m%d-%H%M%S)
+  rand=$(head -c 4 /dev/urandom | od -An -tx4 | tr -d ' ')
+
+  if [[ -n "$ext" ]]; then
+    echo "${base}-${ts}-${rand}.${ext}"
+  else
+    echo "${base}-${ts}-${rand}"
+  fi
+}
+
+upload_file() {
+  local repo="$1"
+  local file="$2"
+
+  [[ -f "$file" && ! -L "$file" ]] || die "File not found or is a symlink: $file"
+
+  local ext="${file##*.}"
+  ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+
+  local category
+  category=$(classify_file "$ext")
+  [[ "$category" != "unsupported" ]] || die "Unsupported file type: .$ext (run --help to see supported formats)"
+
+  local size max_size
+  size=$(file_size "$file")
+  max_size=$(max_size_for "$category")
+  if [[ "$size" -gt "$max_size" ]]; then
+    die "File too large: $file ($(( size / 1024 / 1024 ))MB, max $(( max_size / 1024 / 1024 ))MB for $category files)"
+  fi
+
+  local asset_name
+  asset_name=$(unique_name "$file")
+
+  # Copy to temp file with unique name so asset filename matches URL
+  local tmp_dir
+  tmp_dir=$(mktemp -d)
+  trap 'rm -rf "$tmp_dir" 2>/dev/null' EXIT INT TERM
+  local tmp_file="${tmp_dir}/${asset_name}"
+  cp "$file" "$tmp_file"
+
+  local upload_ok=true
+  if ! gh release upload "$RELEASE_TAG" \
+    --repo "$repo" \
+    --clobber -- "$tmp_file" >/dev/null 2>&1; then
+    upload_ok=false
+  fi
+
+  rm -rf "$tmp_dir"
+  trap - EXIT INT TERM
+  [[ "$upload_ok" == true ]] || die "Upload failed for $file"
+
+  local tag_encoded asset_encoded
+  tag_encoded=$(urlencode "$RELEASE_TAG")
+  asset_encoded=$(urlencode "$asset_name")
+
+  # Return: url|category
+  echo "https://github.com/${repo}/releases/download/${tag_encoded}/${asset_encoded}|${category}"
+}
+
+copy_to_clipboard() {
+  local text="$1"
+  if command -v pbcopy >/dev/null 2>&1; then
+    echo -n "$text" | pbcopy
+  elif command -v xclip >/dev/null 2>&1; then
+    echo -n "$text" | xclip -selection clipboard
+  elif command -v xsel >/dev/null 2>&1; then
+    echo -n "$text" | xsel --clipboard --input
+  elif command -v clip.exe >/dev/null 2>&1; then
+    echo -n "$text" | clip.exe
+  else
+    echo "warning: No clipboard tool found (pbcopy/xclip/xsel/clip.exe)" >&2
+    return 1
+  fi
+  echo "Copied to clipboard!" >&2
+}
+
+# --- Asset Management Commands -----------------------------------------------
+
+# List all assets in the release
+cmd_list() {
+  local repo="$1"
+
+  if ! gh release view "$RELEASE_TAG" --repo "$repo" >/dev/null 2>&1; then
+    echo "No attachments found (release '$RELEASE_TAG' does not exist in $repo)" >&2
+    exit 0
+  fi
+
+  local assets
+  assets=$(gh release view "$RELEASE_TAG" --repo "$repo" --json assets \
+    --jq '.assets[] | "\(.name)\t\(.size)\t\(.createdAt)"' 2>/dev/null)
+
+  if [[ -z "$assets" ]]; then
+    echo "No attachments found" >&2
+    exit 0
+  fi
+
+  local count=0
+  local total_size=0
+  local human_size date_part
+
+  printf "%-50s %10s  %s\n" "NAME" "SIZE" "UPLOADED"
+  printf "%-50s %10s  %s\n" "----" "----" "--------"
+
+  while IFS=$'\t' read -r name size created; do
+    if [[ "$size" -ge $((1024 * 1024)) ]]; then
+      human_size="$(( size / 1024 / 1024 )) MB"
+    elif [[ "$size" -ge 1024 ]]; then
+      human_size="$(( size / 1024 )) KB"
+    else
+      human_size="${size} B"
+    fi
+
+    date_part="${created%%T*}"
+    printf "%-50s %10s  %s\n" "$name" "$human_size" "$date_part"
+    (( count++ )) || true
+    (( total_size += size )) || true
+  done <<< "$assets"
+
+  echo "" >&2
+  local total_human
+  if [[ "$total_size" -ge $((1024 * 1024)) ]]; then
+    total_human="$(( total_size / 1024 / 1024 )) MB"
+  elif [[ "$total_size" -ge 1024 ]]; then
+    total_human="$(( total_size / 1024 )) KB"
+  else
+    total_human="${total_size} B"
+  fi
+  echo "${count} file(s), ${total_human} total" >&2
+}
+
+# Human-readable size formatter
+format_size() {
+  local s=$1
+  if [[ "$s" -ge $((1024 * 1024)) ]]; then
+    echo "$(( s / 1024 / 1024 )) MB"
+  elif [[ "$s" -ge 1024 ]]; then
+    echo "$(( s / 1024 )) KB"
+  else
+    echo "${s} B"
+  fi
+}
+
+# Show storage stats
+cmd_stats() {
+  local repo="$1"
+
+  if ! gh release view "$RELEASE_TAG" --repo "$repo" >/dev/null 2>&1; then
+    echo "No attachments found (release '$RELEASE_TAG' does not exist in $repo)" >&2
+    exit 0
+  fi
+
+  local assets
+  assets=$(gh release view "$RELEASE_TAG" --repo "$repo" --json assets \
+    --jq '.assets[] | "\(.name)\t\(.size)"' 2>/dev/null)
+
+  if [[ -z "$assets" ]]; then
+    echo "No attachments found" >&2
+    exit 0
+  fi
+
+  local count=0 total_size=0
+  local img_count=0 img_size=0
+  local vid_count=0 vid_size=0
+  local aud_count=0 aud_size=0
+  local doc_count=0 doc_size=0
+  local code_count=0 code_size=0
+  local arc_count=0 arc_size=0
+  local other_count=0 other_size=0
+
+  while IFS=$'\t' read -r name size; do
+    local ext="${name##*.}"
+    ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+    local cat
+    cat=$(classify_file "$ext")
+
+    (( count++ )) || true
+    (( total_size += size )) || true
+
+    case "$cat" in
+      image)    (( img_count++ )); (( img_size += size )) ;;
+      video)    (( vid_count++ )); (( vid_size += size )) ;;
+      audio)    (( aud_count++ )); (( aud_size += size )) ;;
+      document) (( doc_count++ )); (( doc_size += size )) ;;
+      code)     (( code_count++ )); (( code_size += size )) ;;
+      archive)  (( arc_count++ )); (( arc_size += size )) ;;
+      *)        (( other_count++ )); (( other_size += size )) ;;
+    esac
+  done <<< "$assets"
+
+  local tag_encoded
+  tag_encoded=$(urlencode "$RELEASE_TAG")
+
+  echo "Storage stats for '$RELEASE_TAG' in $repo"
+  echo ""
+  printf "  %-12s %5s files  %10s\n" "Images" "$img_count" "$(format_size $img_size)"
+  printf "  %-12s %5s files  %10s\n" "Videos" "$vid_count" "$(format_size $vid_size)"
+  printf "  %-12s %5s files  %10s\n" "Audio" "$aud_count" "$(format_size $aud_size)"
+  printf "  %-12s %5s files  %10s\n" "Documents" "$doc_count" "$(format_size $doc_size)"
+  printf "  %-12s %5s files  %10s\n" "Code" "$code_count" "$(format_size $code_size)"
+  printf "  %-12s %5s files  %10s\n" "Archives" "$arc_count" "$(format_size $arc_size)"
+  printf "  %-12s %5s files  %10s\n" "Other" "$other_count" "$(format_size $other_size)"
+  echo "  ────────────────────────────────"
+  printf "  %-12s %5s files  %10s\n" "Total" "$count" "$(format_size $total_size)"
+  echo ""
+  echo "GitHub repo storage limits: 5 GB (warning at 1 GB)"
+  echo "Release assets count toward total repo size."
+  echo "View in browser: https://github.com/${repo}/releases/tag/${tag_encoded}"
+}
+
+# Cleanup old assets
+cmd_cleanup() {
+  local repo="$1"
+  local cleanup_arg="$2"
+
+  # Require interactive terminal for confirmation
+  if [[ ! -t 0 ]]; then
+    die "Cleanup requires interactive confirmation (stdin must be a terminal)"
+  fi
+
+  if ! gh release view "$RELEASE_TAG" --repo "$repo" >/dev/null 2>&1; then
+    echo "No attachments found (release '$RELEASE_TAG' does not exist in $repo)" >&2
+    exit 0
+  fi
+
+  local assets
+  assets=$(gh release view "$RELEASE_TAG" --repo "$repo" --json assets \
+    --jq '.assets | sort_by(.createdAt) | .[] | "\(.name)\t\(.size)\t\(.createdAt)"' 2>/dev/null)
+
+  if [[ -z "$assets" ]]; then
+    echo "No attachments to clean up" >&2
+    exit 0
+  fi
+
+  local total_count
+  total_count=$(echo "$assets" | wc -l | tr -d ' ')
+
+  local to_delete=()
+
+  if [[ "$cleanup_arg" =~ ^[0-9]+d$ ]]; then
+    # Delete assets older than N days
+    local days="${cleanup_arg%d}"
+
+    # Cap days to a reasonable maximum
+    if [[ "$days" -gt 36500 ]]; then
+      die "Invalid cleanup days: ${days} (max 36500 — ~100 years)"
+    fi
+
+    local cutoff
+    if date -v-1d >/dev/null 2>&1; then
+      cutoff=$(date -v-"${days}"d +%Y-%m-%dT%H:%M:%S)
+    else
+      cutoff=$(date -d "${days} days ago" +%Y-%m-%dT%H:%M:%S)
+    fi
+
+    while IFS=$'\t' read -r name size created; do
+      if [[ "$created" < "$cutoff" ]]; then
+        to_delete+=("$name")
+      fi
+    done <<< "$assets"
+
+    if [[ ${#to_delete[@]} -eq 0 ]]; then
+      echo "No assets older than ${days} days" >&2
+      exit 0
+    fi
+
+    echo "Found ${#to_delete[@]} asset(s) older than ${days} days (out of ${total_count} total)" >&2
+
+  elif [[ "$cleanup_arg" =~ ^[0-9]+$ ]]; then
+    # Keep only the latest N assets
+    local keep="$cleanup_arg"
+
+    # Must keep at least 1 asset
+    if [[ "$keep" -lt 1 ]]; then
+      die "Must keep at least 1 asset (got: $keep)"
+    fi
+
+    if [[ "$total_count" -le "$keep" ]]; then
+      echo "Only ${total_count} asset(s) — nothing to clean up (keeping ${keep})" >&2
+      exit 0
+    fi
+
+    local delete_count=$(( total_count - keep ))
+    local i=0
+    while IFS=$'\t' read -r name size created; do
+      if [[ "$i" -lt "$delete_count" ]]; then
+        to_delete+=("$name")
+      fi
+      (( i++ )) || true
+    done <<< "$assets"
+
+    echo "Deleting ${#to_delete[@]} oldest asset(s), keeping latest ${keep} (out of ${total_count} total)" >&2
+
+  else
+    die "Invalid cleanup argument: '$cleanup_arg'. Use '<N>d' for days (e.g. 30d) or '<N>' for count (e.g. 100)"
+  fi
+
+  echo "Proceed? (y/N) " >&2
+  read -r confirm
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    echo "Cancelled" >&2
+    exit 0
+  fi
+
+  local deleted=0
+  local failed=0
+  for name in "${to_delete[@]}"; do
+    if gh release delete-asset "$RELEASE_TAG" "$name" --repo "$repo" --yes >/dev/null 2>&1; then
+      echo "Deleted: $name" >&2
+      (( deleted++ )) || true
+    else
+      echo "Failed to delete: $name" >&2
+      (( failed++ )) || true
+    fi
+  done
+
+  echo "" >&2
+  echo "${deleted} asset(s) deleted" >&2
+  if [[ "$failed" -gt 0 ]]; then
+    echo "${failed} asset(s) failed to delete" >&2
+  fi
+}
+
+# Format a single result as markdown
+format_markdown() {
+  local url="$1"
+  local label="$2"
+  local category="$3"
+
+  if [[ "$category" == "image" ]]; then
+    echo "![${label}](${url})"
+  else
+    local icon
+    icon=$(markdown_icon "$category")
+    echo "[${icon}${label}](${url})"
+  fi
+}
+
+# --- Main ------------------------------------------------------------------
+
+main() {
+  check_prereqs
+
+  local markdown=false
+  local clipboard=false
+  local cmd_mode=""
+  local cleanup_arg=""
+  local args=()
+  REPO=""
+  PUBLIC="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)    usage ;;
+      -v|--version) echo "gh-file-attach $VERSION"; exit 0 ;;
+      -r|--repo)
+        REPO="${2:?--repo requires OWNER/REPO}"
+        validate_repo "$REPO"
+        shift 2
+        ;;
+      -t|--tag)
+        RELEASE_TAG="${2:?--tag requires a value}"
+        validate_tag "$RELEASE_TAG"
+        shift 2
+        ;;
+      -m|--markdown) markdown=true; shift ;;
+      -c|--clipboard) clipboard=true; shift ;;
+      --public)     PUBLIC="true"; shift ;;
+      --list)       cmd_mode="list"; shift ;;
+      --stats)      cmd_mode="stats"; shift ;;
+      --cleanup)
+        cmd_mode="cleanup"
+        cleanup_arg="${2:?--cleanup requires an argument (e.g. 30d or 100)}"
+        shift 2
+        ;;
+      -*)           die "Unknown flag: $1 (use --help for usage)" ;;
+      *)            args+=("$1"); shift ;;
+    esac
+  done
+
+  # Handle management commands
+  if [[ -n "$cmd_mode" ]]; then
+    local repo
+    repo=$(resolve_repo)
+    case "$cmd_mode" in
+      list)    cmd_list "$repo" ;;
+      stats)   cmd_stats "$repo" ;;
+      cleanup) cmd_cleanup "$repo" "$cleanup_arg" ;;
+    esac
+    exit 0
+  fi
+
+  [[ ${#args[@]} -gt 0 ]] || die "No files specified. Usage: gh file-attach <file> [<file>...]"
+
+  # Parse arguments into labels and file paths
+  local files=()
+  local labels=()
+  for arg in "${args[@]}"; do
+    if [[ "$arg" == *:* ]]; then
+      if [[ -f "$arg" ]]; then
+        files+=("$arg")
+        labels+=("")
+      else
+        local label="${arg%%:*}"
+        local path="${arg#*:}"
+        files+=("$path")
+        labels+=("$label")
+      fi
+    else
+      files+=("$arg")
+      labels+=("")
+    fi
+  done
+
+  # Guard against uploading too many files at once
+  if [[ ${#files[@]} -gt "$MAX_FILES_PER_RUN" ]]; then
+    die "Too many files (${#files[@]}). Max ${MAX_FILES_PER_RUN} per invocation."
+  fi
+
+  # Pre-validate all files before touching the remote
+  for file in "${files[@]}"; do
+    [[ -f "$file" && ! -L "$file" ]] || die "File not found or is a symlink: $file"
+    local ext="${file##*.}"
+    ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+    local category
+    category=$(classify_file "$ext")
+    [[ "$category" != "unsupported" ]] || die "Unsupported file type: .$ext (run --help to see supported formats)"
+    local size max_size
+    size=$(file_size "$file")
+    max_size=$(max_size_for "$category")
+    if [[ "$size" -gt "$max_size" ]]; then
+      die "File too large: $file ($(( size / 1024 / 1024 ))MB, max $(( max_size / 1024 / 1024 ))MB for $category files)"
+    fi
+  done
+
+  local repo
+  repo=$(resolve_repo)
+
+  ensure_release "$repo"
+
+  local all_output=""
+  local upload_count=0
+  local fail_count=0
+
+  for i in "${!files[@]}"; do
+    local file="${files[$i]}"
+    local label="${labels[$i]}"
+
+    local result
+    if ! result=$(upload_file "$repo" "$file" 2>&1); then
+      echo "$result" >&2
+      (( fail_count++ )) || true
+      continue
+    fi
+
+    local url="${result%%|*}"
+    local category="${result##*|}"
+    (( upload_count++ )) || true
+
+    local line
+    if [[ "$markdown" == true ]]; then
+      if [[ -z "$label" ]]; then
+        label=$(basename "$file")
+      fi
+      line=$(format_markdown "$url" "$label" "$category")
+    else
+      line="$url"
+    fi
+
+    echo "$line"
+    all_output+="${line}"$'\n'
+  done
+
+  # Summary to stderr
+  if [[ ${#files[@]} -gt 1 ]]; then
+    echo "${upload_count} file(s) uploaded" >&2
+    if [[ "$fail_count" -gt 0 ]]; then
+      echo "${fail_count} file(s) failed" >&2
+    fi
+  fi
+
+  if [[ "$clipboard" == true && -n "$all_output" ]]; then
+    copy_to_clipboard "${all_output%$'\n'}"
+  fi
+
+  # Exit with error if any uploads failed
+  [[ "$fail_count" -eq 0 ]] || exit 1
+}
+
+main "$@"
